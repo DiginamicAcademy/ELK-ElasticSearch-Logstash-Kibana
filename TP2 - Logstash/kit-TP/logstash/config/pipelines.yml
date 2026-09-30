@@ -1,0 +1,6 @@
+# Un pipeline par flux : sans ce fichier, tous les .conf du dossier
+# seraient concaténés en un seul pipeline "main".
+- pipeline.id: offres
+  path.config: "/usr/share/logstash/pipeline/offres.conf"
+- pipeline.id: web
+  path.config: "/usr/share/logstash/pipeline/web.conf"

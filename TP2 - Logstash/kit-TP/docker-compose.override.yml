@@ -1,0 +1,26 @@
+# Ajout de Logstash au docker-compose.yml du TP (fusionné automatiquement par Docker Compose).
+# Service rattaché au profil "logstash" : il ne démarre que s'il est demandé explicitement
+#   docker compose up -d logstash
+services:
+  logstash:
+    image: docker.elastic.co/logstash/logstash:${STACK_VERSION}
+    profiles: ["logstash"]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ES_HOSTS=http://elasticsearch:9200
+      - ES_USER=logstash_internal
+      - ES_PASSWORD=${LOGSTASH_INTERNAL_PASSWORD}
+      - LS_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "127.0.0.1:9600:9600"   # API de supervision de Logstash
+    volumes:
+      - ./logstash/config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./data:/data:ro
+      - lsdata:/usr/share/logstash/data
+    mem_limit: 1g
+
+volumes:
+  lsdata:
