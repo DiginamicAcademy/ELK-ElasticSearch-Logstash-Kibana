@@ -1,0 +1,35 @@
+# Fins de ligne : LF partout, dans le dépôt ET dans la copie de travail.
+#
+# Ce fichier a priorité sur la configuration locale `core.autocrlf`, y compris
+# sur le `core.autocrlf=true` que Git for Windows installe par défaut. Il voyage
+# avec le dépôt : tous les postes obtiennent le même comportement, sans réglage
+# individuel à propager.
+
+* text=auto eol=lf
+
+# Types du projet, déclarés explicitement pour ne rien laisser à la détection.
+*.md      text eol=lf
+*.xml     text eol=lf
+*.gift    text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.json    text eol=lf
+*.sql     text eol=lf
+*.txt     text eol=lf
+.gitattributes  text eol=lf
+.editorconfig   text eol=lf
+
+# Binaires : aucune conversion, aucune tentative de diff textuel.
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.webp    binary
+*.svg     text eol=lf
+*.pdf     binary
+*.zip     binary
+*.woff    binary
+*.woff2   binary
+*.ttf     binary

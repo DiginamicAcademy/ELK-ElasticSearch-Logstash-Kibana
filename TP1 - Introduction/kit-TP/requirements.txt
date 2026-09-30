@@ -1,0 +1,2 @@
+elasticsearch==9.5.1
+python-dotenv==1.2.3

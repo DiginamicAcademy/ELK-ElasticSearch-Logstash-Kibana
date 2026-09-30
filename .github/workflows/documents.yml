@@ -1,0 +1,1143 @@
+name: Documents
+
+# Produit les documents distribuables à partir des sources du dépôt.
+#
+# Le support de cours est toujours produit. Il s'ouvre
+# sur une page de garde (logo, dépôt, version), enchaîne sur le Readme puis,
+# s'il y en a, sur tous les fichiers `.md` de la racine dont le nom commence par
+# un numéro (`01-…`, `1-…`) ou par une lettre (`A-…`, `B-…`), pris dans l'ordre.
+# Chaque chapitre est précédé d'une page d'intercalaire portant son titre de
+# premier niveau. S'il n'y a aucun chapitre, le PDF ne contient que le Readme.
+# Les blocs repliables (`<details>`) sont déplacés, dépliés, dans une annexe
+# qui ferme le document ; un renvoi numéroté les remplace dans le texte.
+#
+# Les diapositives (PDF, PPTX, et leurs variantes `-white` sans le style
+# sombre) ne sont produites que si `slides.md` existe à la racine. Sinon ces
+# étapes sont simplement sautées.
+#
+# Les fichiers produits portent le nom du cours — le titre de niveau 1 du
+# Readme — pour rester identifiables une fois téléchargés :
+#
+#   MongoDB-Python-support-de-cours.pdf
+#   MongoDB-Python-slides.pdf
+#   MongoDB-Python-slides-white.pptx
+#
+# Le support est crédité : un fichier `AUTHORS` à la racine, s'il existe, porte
+# la ou les signatures — elles apparaissent sur la page de garde et ouvrent la
+# section « Crédits » qui ferme le document. Les contributeurs y sont listés
+# ensuite, tirés de l'historique git et enrichis des comptes GitHub.
+#
+# Le workflow se déclenche uniquement sur un tag `v*` : les documents sont
+# produits pour une version identifiée, jamais à chaque commit. Ils sont
+# publiés comme artefact du run (90 jours) ET attachés à une release GitHub,
+# en téléchargement direct et permanent.
+#
+#   git tag v1.0 && git push origin v1.0
+#
+# `workflow_dispatch` reste ouvert pour un essai à blanc : il produit
+# l'artefact sans créer de release, ce qui permet de valider le rendu sans
+# consommer un numéro de version.
+#
+# Les actions sont épinglées sur une majeure. Pour un usage réellement en
+# production, épinglez-les sur un SHA de commit plutôt que sur un tag mouvant.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Versions exactes : le rendu doit être reproductible d'un run à l'autre.
+  # À bumper volontairement, pas à laisser flotter sur @latest.
+  MARP_VERSION: 4.5.1
+  MD_TO_PDF_VERSION: 5.2.5
+  MERMAID_CLI_VERSION: 11.17.0
+
+  # Logo inliné dans l'en-tête du support de cours. Récupéré au build plutôt
+  # que versionné : une seule source de vérité, le dépôt PublicAssets.
+  LOGO_URL: https://raw.githubusercontent.com/DiginamicInternal/PublicAssets/refs/heads/main/Logo-diginamic-color.svg
+
+  # Le délai par défaut de Marp est de 30 s, insuffisant dès que le rendu charge
+  # des ressources distantes (logo, illustrations).
+  PUPPETEER_TIMEOUT: "180000"
+
+jobs:
+  build:
+    name: Générer les documents
+    runs-on: ubuntu-latest
+
+    outputs:
+      title: ${{ steps.meta.outputs.title }}
+
+    steps:
+      # `fetch-depth: 0` : par défaut le checkout est superficiel (un seul
+      # commit), et les crédits se lisent dans l'historique complet.
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Installer Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Marp détecte Chrome tout seul, mais md-to-pdf et mermaid-cli attendent
+      # un Chrome installé par Puppeteer, absent du runner. On leur passe donc
+      # explicitement le binaire préinstallé, sans le télécharger.
+      - name: Localiser Chrome
+        run: |
+          CHROME="$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+          if [ -z "$CHROME" ]; then
+            echo "::error::Aucun navigateur Chromium trouvé sur le runner."
+            exit 1
+          fi
+          echo "Chrome trouvé : $CHROME ($("$CHROME" --version))"
+          echo "CHROME_BIN=$CHROME" >> "$GITHUB_ENV"
+
+      # Un seul endroit où l'on décide « qu'est-ce qu'on a sous la main ? ».
+      # Le reste du workflow ne fait que consommer ces valeurs.
+      - name: Inventorier les sources
+        id: meta
+        run: |
+          mkdir -p dist build
+
+          # Le nom du Readme varie d'un dépôt à l'autre, et le runner est
+          # sensible à la casse : on cherche les graphies usuelles.
+          README_FILE=""
+          for candidate in README.md Readme.md readme.md; do
+            if [ -f "$candidate" ]; then README_FILE="$candidate"; break; fi
+          done
+          if [ -z "$README_FILE" ]; then
+            echo "::error::Aucun Readme trouvé à la racine du dépôt."
+            exit 1
+          fi
+
+          # Titre du document : le premier titre de niveau 1 du Readme.
+          TITLE="$(sed -n 's/^# \+//p' "$README_FILE" | head -1)"
+          [ -n "$TITLE" ] || TITLE="${GITHUB_REPOSITORY##*/}"
+
+          # Les documents circulent seuls, hors du dépôt : leur nom de fichier
+          # doit dire de quel cours ils viennent. Le titre est donc réduit à de
+          # l'ASCII alphanumérique séparé par des tirets — « MongoDB & Python »
+          # donne « MongoDB-Python ».
+          #
+          # Ni espace ni accent, et c'est délibéré : GitHub réécrit le nom des
+          # fichiers attachés à une release et remplace par un point tout ce qui
+          # sort de cet alphabet. « MongoDB & Python - support de cours.pdf » se
+          # téléchargerait « MongoDB.&.Python.-.support.de.cours.pdf ». En n'en
+          # sortant pas, le nom construit ici est celui que le lecteur verra.
+          #
+          # Node plutôt que `iconv -t ASCII//TRANSLIT` pour retirer les
+          # accents : la translittération de la glibc dépend de la locale du
+          # runner et rend « é » tantôt « e », tantôt « ? ». La décomposition
+          # NFD, elle, donne le même résultat partout.
+          SLUG="$(TITLE="$TITLE" node -e '
+            process.stdout.write(
+              process.env.TITLE
+                .normalize("NFD")
+                .replace(/\p{Diacritic}/gu, "")
+                .replace(/[^A-Za-z0-9]+/g, "-")
+                .replace(/^-+|-+$/g, "")
+            );
+          ')"
+          [ -n "$SLUG" ] || SLUG="${GITHUB_REPOSITORY##*/}"
+
+          echo "README_FILE=$README_FILE" >> "$GITHUB_ENV"
+          echo "DOC_TITLE=$TITLE" >> "$GITHUB_ENV"
+          echo "DOC_SLUG=$SLUG" >> "$GITHUB_ENV"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+          # Chapitres : les `.md` de la racine dont le nom commence par un
+          # numéro (`01-…`, `1-…`) ou par une lettre (`A-…`, `B-…`), suivi d'un
+          # séparateur. C'est ce séparateur qui fait la différence entre un
+          # chapitre et un fichier ordinaire : ni `README.md` ni `slides.md` ne
+          # correspondent. Revers de la médaille, un `a-propos.md` posé à la
+          # racine serait pris pour le chapitre « a » ; la liste est journalisée
+          # juste en dessous, de quoi s'en apercevoir au premier run.
+          #
+          # `sort -V` range « 100-… » après « 14-… », là où l'ordre
+          # lexicographique le placerait avant, et fait passer les numéros avant
+          # les lettres si un dépôt mélange les deux conventions.
+          #
+          # La liste est écrite sur disque : l'étape d'assemblage la relit au
+          # lieu de refaire la même recherche, un seul endroit décide.
+          find . -maxdepth 1 -name '*.md' -printf '%f\n' \
+            | grep -E '^([0-9]+|[A-Za-z])[-._ ]' \
+            | grep -vxF "$README_FILE" \
+            | sort -V > build/chapters.txt
+
+          echo "Readme : $README_FILE"
+          echo "Titre  : $TITLE"
+          echo "Nom    : $SLUG-…"
+          echo "Slides : $([ -f slides.md ] && echo oui || echo non)"
+          if [ -s build/chapters.txt ]; then
+            echo "Chapitres :"
+            sed 's/^/  - /' build/chapters.txt
+          else
+            echo "Chapitres : aucun (le support ne contiendra que le Readme)"
+          fi
+
+      # Qui signe le cours, et qui y a mis la main.
+      #
+      # `AUTHORS`, s'il existe, porte la ou les signatures : c'est une décision
+      # éditoriale, pas une statistique, donc elle se déclare plutôt qu'elle ne
+      # se calcule. Une ligne par personne, les lignes vides et les `#` ignorés.
+      # Sans ce fichier, le document ne cite que les contributeurs.
+      #
+      # Les contributeurs, eux, sortent de l'historique git — et non de
+      # l'endpoint `contributors` de GitHub, qui perdrait les commits dont
+      # l'adresse n'est rattachée à aucun compte. GitHub ne sert qu'à enrichir :
+      # il seul sait relier une adresse de commit à un compte, d'où l'on tire un
+      # nom affichable et une adresse publique.
+      #
+      # Tout est « best effort » : sans réseau, sans droits ou sans compte
+      # correspondant, on retombe sur l'identité du commit. Un document doit
+      # pouvoir se construire même quand l'API ne répond pas.
+      - name: Recenser les crédits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          : > build/authors.txt
+          : > build/authors-line.txt
+          : > build/contributors.txt
+
+          if [ -f AUTHORS ]; then
+            grep -vE '^[[:space:]]*(#|$)' AUTHORS > build/authors.txt || true
+          fi
+
+          # « A », « A et B », « A, B et C » — la même chaîne servira à la page
+          # de garde et à la section de crédits, écrite une fois pour les deux.
+          if [ -s build/authors.txt ]; then
+            awk '{ n[NR] = $0 }
+                 END { for (i = 1; i <= NR; i++) {
+                         printf "%s", n[i]
+                         if (i < NR - 1) printf ", "
+                         else if (i == NR - 1) printf " et "
+                       }
+                       printf "\n" }' build/authors.txt > build/authors-line.txt
+            echo "Signature(s) : $(cat build/authors-line.txt)"
+          else
+            echo "Signature(s) : aucune (pas de fichier AUTHORS)"
+          fi
+
+          # Identités des commits, les plus prolifiques d'abord. `%aN` et `%aE`
+          # passent par .mailmap : un fichier à la racine suffit à fusionner les
+          # adresses multiples d'une même personne.
+          git log --format='%aN%x09%aE' \
+            | sort | uniq -c | sort -rn | sed 's/^ *[0-9][0-9]* //' \
+            > build/git-identities.tsv
+
+          # Correspondance adresse de commit -> compte GitHub, telle que GitHub
+          # l'établit lui-même.
+          if ! gh api "repos/${GITHUB_REPOSITORY}/commits" --paginate \
+                 --jq '.[] | select(.author != null)
+                           | [.commit.author.email, .author.login] | @tsv' \
+                 > build/gh-commits.tsv 2>build/gh-error.txt; then
+            echo "::warning::Comptes GitHub non récupérés ($(head -1 build/gh-error.txt)) : les identités des commits sont utilisées telles quelles."
+            : > build/gh-commits.tsv
+          fi
+          sort -u build/gh-commits.tsv -o build/logins.tsv
+
+          while IFS="$(printf '\t')" read -r name email; do
+            [ -n "$name" ] || continue
+
+            # Claude n'est pas cité, les robots non plus. Les trailers
+            # `Co-Authored-By` ne sont de toute façon pas lus : `%aN` ne rend
+            # que l'auteur du commit.
+            case "$email" in *noreply@anthropic.com) continue ;; esac
+            case "$name" in Claude*|*'[bot]') continue ;; esac
+
+            login="$(awk -F'\t' -v e="$email" '$1 == e { print $2; exit }' build/logins.tsv)"
+            if [ -n "$login" ]; then
+              account="$(gh api "users/$login" --jq '[.name // "", .email // ""] | @tsv' 2>/dev/null)" || account=""
+              gh_name="$(printf '%s' "$account" | cut -f1)"
+              gh_email="$(printf '%s' "$account" | cut -f2)"
+              # Le nom du compte prime sur celui du commit, souvent un pseudo.
+              if [ -n "$gh_name" ]; then name="$gh_name"; fi
+              # L'adresse publique du compte prime : c'est celle que la personne
+              # a choisi d'exposer.
+              if [ -n "$gh_email" ]; then email="$gh_email"; fi
+            fi
+
+            # Déjà crédité comme signataire : on ne le répète pas plus bas.
+            if [ -s build/authors.txt ] && grep -qxF "$name" build/authors.txt; then
+              continue
+            fi
+
+            # Une adresse `noreply` n'apprend rien à personne : mieux vaut le
+            # nom seul.
+            case "$email" in *noreply*) email="" ;; esac
+
+            if [ -n "$email" ]; then
+              printf '%s <%s>\n' "$name" "$email" >> build/contributors.txt
+            else
+              printf '%s\n' "$name" >> build/contributors.txt
+            fi
+          done < build/git-identities.tsv
+
+          # Deux identités git peuvent mener au même compte : on dédoublonne
+          # après enrichissement, en gardant l'ordre.
+          awk '!seen[$0]++' build/contributors.txt > build/contributors.tmp
+          mv build/contributors.tmp build/contributors.txt
+
+          if [ -s build/contributors.txt ]; then
+            echo "Contributeurs :"
+            sed 's/^/  - /' build/contributors.txt
+          else
+            echo "Contributeurs : aucun (hors signataires)"
+          fi
+
+      # ---------------------------------------------------------------- slides
+
+      # Les cinq étapes qui suivent ne s'exécutent que si `slides.md` existe.
+      #
+      # `--allow-local-files` : pour produire un PDF ou un PPTX, Marp passe par
+      # un navigateur, et lui interdit par défaut de lire les fichiers locaux.
+      # Sans ce drapeau, une image du dépôt (`./res/logo.png`) resterait vide.
+      # Les fichiers lus sont ceux du dépôt lui-même : l'accès est sans risque.
+
+      - name: Générer les diapositives en PDF
+        if: hashFiles('slides.md') != ''
+        run: |
+          npx --yes "@marp-team/marp-cli@${MARP_VERSION}" slides.md \
+            --pdf \
+            --pdf-outlines \
+            --allow-local-files \
+            --output "dist/${DOC_SLUG}-slides.pdf"
+
+      - name: Générer les diapositives en PPTX
+        if: hashFiles('slides.md') != ''
+        run: |
+          npx --yes "@marp-team/marp-cli@${MARP_VERSION}" slides.md \
+            --pptx \
+            --allow-local-files \
+            --output "dist/${DOC_SLUG}-slides.pptx"
+
+      # Deux transformations : on remplace le bloc `style:` (fond sombre) par
+      # `WHITE_STYLE`, puis on échange le logo du footer. Le PNG « -blk » est
+      # fait pour le fond sombre ; sur fond blanc, c'est le SVG couleur qu'il faut.
+      #
+      # La version white est écrite à la racine, à côté de `slides.md`, et non
+      # dans `build/` : Marp résout les chemins des images par rapport au
+      # fichier Markdown, et `./res/logo.png` doit y désigner la même image.
+      #
+      # `WHITE_STYLE` ne porte que ce qui ne dépend pas du fond (tailles de
+      # police, encadré des citations…) : les couleurs restent celles du thème
+      # par défaut. La bordure verte des citations fait exception, lisible sur
+      # les deux fonds. Une règle de ce genre ajoutée au style de `slides.md`
+      # doit donc être reportée ici, à l'identique.
+      #
+      # Le remplacement du style est borné au front matter — le premier bloc
+      # `---` du fichier. Sans cette borne, un bloc `style:` cité en exemple dans
+      # une diapositive serait vidé lui aussi, et la diapositive qui explique le
+      # gabarit se contredirait d'une version à l'autre.
+      #
+      # L'échange de logo, lui, reste global : une diapositive qui affiche le
+      # logo sombre dans son corps doit passer au logo couleur comme le pied de
+      # page. Le nom du fichier cité dans un exemple y sera donc échangé aussi.
+      - name: Préparer la version white
+        if: hashFiles('slides.md') != ''
+        env:
+          WHITE_STYLE: |
+            style: |
+              section table {font-size: 0.85em}
+              blockquote {border: 2px green solid; border-left-width: 15px; padding: 0.5em 15px;font-style: italic }
+        run: |
+          awk '
+            NR == 1 && $0 == "---" { fm = 1; print; next }
+            fm && $0 == "---"      { fm = 0; skip = 0; printf "%s", ENVIRON["WHITE_STYLE"]; print; next }
+            fm && $0 ~ /^style:[[:space:]]*[|>]/ { skip = 1; next }
+            skip && $0 ~ /^[[:space:]]/ { next }
+            skip { skip = 0 }
+            { print }
+          ' slides.md \
+          | sed 's|Logo-diginamic-color-blk\.png|Logo-diginamic-color.svg|g' \
+          > slides-white.md
+          sed -n '1,/^---$/p' slides-white.md
+          grep -n Logo-diginamic slides-white.md
+
+      - name: Générer les diapositives white en PDF
+        if: hashFiles('slides.md') != ''
+        run: |
+          npx --yes "@marp-team/marp-cli@${MARP_VERSION}" slides-white.md \
+            --pdf \
+            --pdf-outlines \
+            --allow-local-files \
+            --output "dist/${DOC_SLUG}-slides-white.pdf"
+
+      - name: Générer les diapositives white en PPTX
+        if: hashFiles('slides.md') != ''
+        run: |
+          npx --yes "@marp-team/marp-cli@${MARP_VERSION}" slides-white.md \
+            --pptx \
+            --allow-local-files \
+            --output "dist/${DOC_SLUG}-slides-white.pptx"
+
+      # --------------------------------------------------------------- support
+
+      # Le support est un seul Markdown : le Readme, puis chaque chapitre
+      # précédé de son intercalaire. L'assemblage a lieu dans `build/`
+      # uniquement — aucun fichier du dépôt n'est modifié, pour que GitHub
+      # continue d'afficher les sources telles quelles.
+      #
+      # De chaque chapitre on retire tout ce qui précède son titre de niveau 1,
+      # titre compris : la ligne de navigation (« ← Étape 05 · Sommaire · Étape
+      # suivante → ») n'a aucun sens dans un document relié, et le titre est
+      # déjà porté par l'intercalaire.
+      - name: Assembler le support de cours
+        run: |
+          OUT=build/support-de-cours.md
+          MANIFEST=build/anchors.tsv
+
+          # Ancre de destination d'un fichier source, dérivée de son nom. Le
+          # préfixe `src-` évite toute collision avec les ancres de titres.
+          anchor_of() {
+            printf 'src-%s' "$(printf '%s' "${1%.md}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | tr -c 'a-z0-9' '-' \
+              | sed 's/-\+/-/g; s/^-//; s/-$//')"
+          }
+
+          # Le Readme ouvre le document : son ancre est posée tout en haut, pour
+          # que les « retour au sommaire » des chapitres aient une cible.
+          README_ANCHOR="$(anchor_of "$README_FILE")"
+          printf '<a id="%s"></a>\n\n' "$README_ANCHOR" > "$OUT"
+          cat "$README_FILE" >> "$OUT"
+
+          printf '%s\t%s\n' "$README_FILE" "$README_ANCHOR" > "$MANIFEST"
+
+          # Liste établie et triée par l'étape d'inventaire.
+          mapfile -t chapters < build/chapters.txt
+
+          count=0
+          for f in "${chapters[@]}"; do
+            title="$(sed -n 's/^# \+//p' "$f" | head -1)"
+
+            if [ -n "$title" ]; then
+              # Le titre existe : l'intercalaire le porte, et le corps du
+              # chapitre reprend juste après cette ligne.
+              body="$(awk 'seen { print } /^# / && !seen { seen = 1 }' "$f")"
+            else
+              # Pas de titre de niveau 1 : on se rabat sur le nom du fichier, et
+              # on garde le fichier entier plutôt que de le vider.
+              title="${f%.md}"
+              body="$(cat "$f")"
+            fi
+
+            # Le titre part dans un bloc HTML : &, < et > doivent être échappés.
+            title_html="$(printf '%s' "$title" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+
+            # L'intercalaire porte l'ancre du chapitre : c'est là qu'atterrissent
+            # les liens internes du PDF.
+            anchor="$(anchor_of "$f")"
+            printf '%s\t%s\n' "$f" "$anchor" >> "$MANIFEST"
+
+            {
+              printf '\n<div class="intercalaire" id="%s"><span>%s</span></div>\n\n' \
+                "$anchor" "$title_html"
+              printf '%s\n' "$body"
+            } >> "$OUT"
+
+            count=$((count + 1))
+            echo "Ajouté : $f — $title (ancre #$anchor)"
+          done
+
+          if [ "$count" -eq 0 ]; then
+            echo "Aucun chapitre : le support ne contient que $README_FILE."
+          else
+            echo "$count chapitre(s) ajouté(s) après $README_FILE."
+          fi
+
+      # Dans un PDF, un lien vers `10-schema-souple.md` ne mène nulle part : le
+      # fichier n'existe pas à côté du lecteur. On les convertit donc en liens
+      # internes vers l'intercalaire du chapitre, et on retire ceux dont la
+      # cible ne figure pas dans le document.
+      - name: Convertir les liens entre fichiers en liens internes
+        run: |
+          cat > build/rewrite-links.js <<'JS'
+          const fs = require('fs');
+
+          const [, , mdPath, manifestPath] = process.argv;
+
+          const anchors = new Map();
+          for (const line of fs.readFileSync(manifestPath, 'utf8').split('\n')) {
+            if (!line.trim()) continue;
+            const [file, anchor] = line.split('\t');
+            anchors.set(file, anchor);
+          }
+
+          // Libellé entre crochets, cible entre parenthèses, titre optionnel.
+          // Le `(?<!!)` écarte les images : `![alt](src)` n'est pas un lien.
+          const LINK = /(?<!!)\[([^\]]*)\]\(\s*([^)\s]+)(\s+"[^"]*")?\s*\)/g;
+          const EXTERNAL = /^(https?:|mailto:|tel:|#)/i;
+
+          let internal = 0;
+          let removed = 0;
+          const unknown = new Map();
+          let inFence = false;
+
+          const out = fs
+            .readFileSync(mdPath, 'utf8')
+            .split('\n')
+            .map((line) => {
+              // Ce qu'un bloc de code contient est du texte à lire, pas des
+              // liens à suivre : on le laisse intact.
+              if (/^\s*(```|~~~)/.test(line)) {
+                inFence = !inFence;
+                return line;
+              }
+              if (inFence) return line;
+
+              return line.replace(LINK, (match, label, target) => {
+                if (EXTERNAL.test(target)) return match;
+
+                let base = target.split('#')[0];
+                try {
+                  base = decodeURIComponent(base);
+                } catch {
+                  // Cible non décodable : gardée telle quelle pour la recherche.
+                }
+
+                const anchor = anchors.get(base);
+                if (anchor) {
+                  internal += 1;
+                  // Le fragment éventuel est abandonné : la cible est
+                  // l'intercalaire du chapitre, seule ancre dont on garantisse
+                  // l'existence dans le PDF.
+                  return `[${label}](#${anchor})`;
+                }
+
+                removed += 1;
+                unknown.set(base, (unknown.get(base) ?? 0) + 1);
+                return label;
+              });
+            })
+            .join('\n');
+
+          fs.writeFileSync(mdPath, out);
+
+          console.log(`Liens convertis en liens internes : ${internal}`);
+          console.log(`Liens retirés (cible hors du PDF) : ${removed}`);
+          for (const [target, n] of [...unknown].sort((a, b) => b[1] - a[1])) {
+            console.log(`  - ${target} (${n})`);
+          }
+          JS
+
+          node build/rewrite-links.js build/support-de-cours.md build/anchors.tsv
+
+          # Garde-fou : plus aucun lien relatif ne doit pointer vers un fichier
+          # .md. Les URL absolues sont exclues, comme dans le script : un lien
+          # vers le `.md` d'un autre dépôt (le cours, sur GitHub) reste un lien
+          # web valide dans le PDF.
+          if grep -nP '\]\(\s*(?!(?i:https?:|mailto:|tel:)|#)\S*\.md' build/support-de-cours.md; then
+            echo "::error::Des liens relatifs vers des fichiers .md subsistent dans le support."
+            exit 1
+          fi
+
+      # Un bloc `<details>` se replie dans le navigateur, mais sur papier il n'y
+      # a rien à déplier : Chrome imprime le seul résumé (« Voir la réponse »),
+      # et la réponse disparaît du PDF. Chaque bloc est donc déplacé, déplié,
+      # dans une annexe en fin de document. À sa place, un renvoi cliquable
+      # porte son numéro (« Voir la réponse → annexe 3 »), de quoi le retrouver
+      # aussi sur une version imprimée. Chaque entrée d'annexe porte le titre de
+      # la section d'où elle vient et renvoie au texte ; les entrées sont
+      # regroupées sous le titre de leur chapitre, sans quoi les « Vous
+      # faites » ou « Exercice » de chaque chapitre ne se distingueraient plus.
+      #
+      # Seuls les blocs qui ouvrent leur ligne sont déplacés, les blocs
+      # imbriqués restant avec leur parent. Tout `<details>` resté en place
+      # reçoit l'attribut `open` : il s'imprime au moins déplié. Les blocs de
+      # code ne sont pas touchés — un cours de HTML peut y citer `<details>`.
+      #
+      # L'étape passe avant les crédits, qui doivent rester la dernière section.
+      - name: Déplacer les blocs repliables en annexe
+        run: |
+          cat > build/details-to-annex.js <<'JS'
+          const fs = require('fs');
+
+          const [, , mdPath] = process.argv;
+
+          const FENCE = /^\s*(```|~~~)/;
+          const count = (re, s) => (s.match(re) || []).length;
+          const OPEN = /<details\b/gi;
+          const CLOSE = /<\/details\s*>/gi;
+
+          const unescapeHtml = (s) =>
+            s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+          // Tout <details> hors bloc de code s'imprime déplié.
+          const forceOpen = (lines) => {
+            let fenced = false;
+            return lines.map((line) => {
+              if (FENCE.test(line)) {
+                fenced = !fenced;
+                return line;
+              }
+              return fenced ? line : line.replace(/<details\b(?![^>]*\bopen\b)/gi, '<details open');
+            });
+          };
+
+          const body = [];
+          const annexes = [];
+          let inFence = false;
+          let chapter = '';
+          let section = '';
+          let block = null;
+
+          // Le bloc complet est dans `block.lines` : il part en annexe, un
+          // renvoi prend sa place.
+          const move = () => {
+            const n = annexes.length + 1;
+            let summary = 'Voir le détail';
+
+            let raw = block.lines.join('\n');
+            raw = raw.replace(/<details\b[^>]*>/i, '');
+            // Le résumé du bloc suit directement la balise ouvrante : un
+            // <summary> plus loin appartient à un bloc imbriqué.
+            raw = raw.replace(/^\s*<summary\b[^>]*>([\s\S]*?)<\/summary\s*>/i, (m, text) => {
+              if (text.trim()) summary = text.trim();
+              return '';
+            });
+            // La dernière balise fermante est celle du bloc : les précédentes
+            // appartiennent aux blocs imbriqués.
+            const end = raw.search(/<\/details\s*>(?![\s\S]*<\/details\s*>)/i);
+            if (end >= 0) raw = raw.slice(0, end) + raw.slice(end).replace(/<\/details\s*>/i, '');
+
+            // Un bloc indenté (dans un élément de liste) est ramené en marge.
+            const content = raw
+              .split('\n')
+              .map((line) => (line.startsWith(block.indent) ? line.slice(block.indent.length) : line))
+              .join('\n')
+              .replace(/^\s*\n|\n\s*$/g, '');
+
+            annexes.push({ n, summary, chapter: block.chapter, title: block.section || summary, content });
+            body.push(
+              `${block.indent}<p class="renvoi-annexe" id="pdf-renvoi-${n}"><a href="#pdf-annexe-${n}">${summary} → annexe ${n}</a></p>`,
+              '',
+            );
+            block = null;
+          };
+
+          for (const line of fs.readFileSync(mdPath, 'utf8').split('\n')) {
+            if (block) {
+              block.lines.push(line);
+              if (FENCE.test(line)) {
+                block.fenced = !block.fenced;
+                continue;
+              }
+              if (block.fenced) continue;
+              block.depth += count(OPEN, line) - count(CLOSE, line);
+              if (block.depth <= 0) move();
+              continue;
+            }
+
+            if (FENCE.test(line)) inFence = !inFence;
+            if (inFence || FENCE.test(line)) {
+              body.push(line);
+              continue;
+            }
+
+            // Le chapitre courant (dernier intercalaire) et sa section (dernier
+            // titre). Le Readme, avant tout intercalaire, n'a pas de chapitre.
+            const heading = line.match(/^#{1,6}\s+(.*?)(\s+#+)?\s*$/);
+            if (heading) section = heading[1];
+            const divider = line.match(/<div class="intercalaire"[^>]*><span>(.*)<\/span><\/div>/);
+            if (divider) {
+              chapter = unescapeHtml(divider[1]);
+              section = '';
+            }
+
+            if (/^\s*<details\b/i.test(line)) {
+              block = {
+                lines: [line],
+                depth: count(OPEN, line) - count(CLOSE, line),
+                indent: line.match(/^\s*/)[0],
+                chapter,
+                section,
+                fenced: false,
+              };
+              if (block.depth <= 0) move();
+              continue;
+            }
+
+            body.push(line);
+          }
+
+          if (block) {
+            console.log(`::warning::<details> jamais refermé (section « ${block.section || block.chapter} ») : laissé en place.`);
+            body.push(...block.lines);
+          }
+
+          const out = [...body];
+          if (annexes.length) {
+            out.push('', '<div class="intercalaire" id="pdf-annexes"><span>Annexes</span></div>', '');
+            let current = '';
+            for (const { n, chapter: from, title, content } of annexes) {
+              // Un titre de chapitre à chaque changement de chapitre ; ses
+              // entrées descendent alors d'un niveau.
+              if (from && from !== current) out.push(`## ${from}`, '');
+              current = from;
+              out.push(
+                `<a id="pdf-annexe-${n}"></a>`,
+                '',
+                `${from ? '###' : '##'} Annexe ${n} — ${title}`,
+                '',
+                `<p class="retour-annexe"><a href="#pdf-renvoi-${n}">↩ Retour au texte</a></p>`,
+                '',
+                content,
+                '',
+              );
+            }
+          }
+
+          fs.writeFileSync(mdPath, forceOpen(out).join('\n'));
+
+          console.log(`Blocs <details> déplacés en annexe : ${annexes.length}`);
+          for (const { n, summary, chapter: from, title } of annexes) {
+            console.log(`  ${n}. ${from ? `${from} › ` : ''}${title} (« ${summary} »)`);
+          }
+          JS
+
+          node build/details-to-annex.js build/support-de-cours.md
+
+      # Les chemins des images locales (`./res/logo.png`) sont écrits depuis la
+      # racine du dépôt, où vivent le Readme et les chapitres. Le support, lui,
+      # est assemblé et converti dans `build/`, et md-to-pdf y résout ces
+      # chemins par rapport au document : ils n'y mènent plus à rien, et le PDF
+      # garderait des cadres vides. Chaque image locale référencée est donc
+      # recopiée dans `build/`, au même chemin relatif.
+      #
+      # Recopier plutôt qu'intégrer en data URI : md-to-pdf ouvre d'abord le
+      # Markdown lui-même comme page de base, et quelques centaines de Ko de
+      # base64 sur une ligne suffisent à lui faire dépasser son délai.
+      #
+      # L'étape passe avant le rendu mermaid : les SVG que produit mermaid-cli
+      # sont écrits dans `build/`, à côté du document, et s'y trouvent déjà.
+      - name: Recopier les images locales du support
+        run: |
+          cat > build/stage-images.js <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+
+          const [, , mdPath, rootDir, destDir] = process.argv;
+          const root = path.resolve(rootDir);
+          const dest = path.resolve(destDir);
+
+          // Un schéma (`https:`, `data:`…), `//` ou `#` : rien à recopier.
+          const NOT_LOCAL = /^([a-z][a-z0-9+.-]*:|\/\/|#)/i;
+
+          // Un code en ligne d'abord, pour le laisser de côté : `![alt](x.png)`
+          // cité dans un cours de Markdown est un exemple, pas une image. Puis
+          // une image Markdown, puis une balise <img>.
+          const TOKEN =
+            /(`+).*?\1|!\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]+)|<img\b[^>]*?\bsrc\s*=\s*(["'])(.*?)\3/gi;
+
+          const copied = new Set();
+          const missing = [];
+
+          const stage = (target) => {
+            if (NOT_LOCAL.test(target)) return;
+
+            let rel = target.split(/[?#]/)[0];
+            try {
+              rel = decodeURIComponent(rel);
+            } catch {
+              // Cible non décodable : gardée telle quelle pour la recherche.
+            }
+
+            // `/res/x.png` désigne, comme sur GitHub, la racine du dépôt.
+            rel = path.normalize(rel.replace(/^\/+/, ''));
+            const src = path.join(root, rel);
+            const outside = rel === '..' || rel.startsWith(`..${path.sep}`);
+            if (outside || !fs.statSync(src, { throwIfNoEntry: false })?.isFile()) {
+              missing.push(target);
+              return;
+            }
+
+            if (copied.has(rel)) return;
+            fs.mkdirSync(path.dirname(path.join(dest, rel)), { recursive: true });
+            fs.copyFileSync(src, path.join(dest, rel));
+            copied.add(rel);
+          };
+
+          let inFence = false;
+
+          for (const line of fs.readFileSync(mdPath, 'utf8').split('\n')) {
+            if (/^\s*(```|~~~)/.test(line)) {
+              inFence = !inFence;
+              continue;
+            }
+            if (inFence) continue;
+
+            for (const [, ticks, mdTarget, , imgTarget] of line.matchAll(TOKEN)) {
+              if (ticks) continue;
+              stage(mdTarget ? mdTarget.replace(/^<|>$/g, '') : imgTarget);
+            }
+          }
+
+          console.log(`Images locales recopiées dans ${path.relative(root, dest)}/ : ${copied.size}`);
+          for (const rel of copied) console.log(`  - ${rel}`);
+          // Garde-fou : une image introuvable serait un cadre vide dans le PDF.
+          for (const target of missing) {
+            console.log(`::error::Image locale introuvable : ${target}`);
+          }
+          if (missing.length) process.exit(1);
+          JS
+
+          node build/stage-images.js build/support-de-cours.md . build
+
+      # Les crédits ferment le document. Ils sont ajoutés après la conversion
+      # des liens : ils n'en contiennent aucun vers un `.md`, et l'adresse entre
+      # chevrons doit rester un lien `mailto:` cliquable dans le PDF.
+      - name: Ajouter les crédits en fin de document
+        working-directory: build
+        run: |
+          if [ ! -s authors-line.txt ] && [ ! -s contributors.txt ]; then
+            echo "Ni signature ni contributeur : pas de section Crédits."
+            exit 0
+          fi
+
+          {
+            printf '\n## Crédits\n\n'
+
+            if [ -s authors-line.txt ]; then
+              printf 'Cours de %s.\n' "$(cat authors-line.txt)"
+              if [ -s contributors.txt ]; then
+                printf '\nOnt également contribué :\n\n'
+              fi
+            else
+              printf 'Ont contribué à ce cours :\n\n'
+            fi
+
+            if [ -s contributors.txt ]; then
+              sed 's/^/- /' contributors.txt
+            fi
+          } >> support-de-cours.md
+
+          tail -15 support-de-cours.md
+
+      # md-to-pdf rendrait un bloc mermaid en bloc de code brut : mermaid-cli le
+      # remplace d'abord par un SVG. L'étape lance un Chrome, donc on la saute
+      # quand le document assemblé ne contient aucun diagramme.
+      #
+      # Par défaut, mermaid produit des SVG en `width="100%"`, sans taille
+      # propre : dans le PDF, chaque diagramme s'étire alors sur toute la
+      # largeur de la page, et un diagramme vertical (`flowchart TD`) déborde
+      # sur deux ou trois pages. `useMaxWidth: false` leur rend leur taille
+      # naturelle ; la feuille de style du support les réduit ensuite, si
+      # besoin, à la zone imprimable.
+      - name: Rendre les diagrammes mermaid
+        working-directory: build
+        run: |
+          if ! grep -q '^```mermaid' support-de-cours.md; then
+            echo "Aucun bloc mermaid dans le support : étape sautée."
+            exit 0
+          fi
+          export PUPPETEER_EXECUTABLE_PATH="$CHROME_BIN"
+
+          # Une clé par type de diagramme : mermaid n'a pas de réglage global.
+          cat > mermaid-config.json <<'JSON'
+          {
+            "flowchart": { "useMaxWidth": false },
+            "sequence": { "useMaxWidth": false },
+            "class": { "useMaxWidth": false },
+            "state": { "useMaxWidth": false },
+            "er": { "useMaxWidth": false },
+            "gantt": { "useMaxWidth": false },
+            "journey": { "useMaxWidth": false },
+            "timeline": { "useMaxWidth": false },
+            "mindmap": { "useMaxWidth": false },
+            "pie": { "useMaxWidth": false }
+          }
+          JSON
+
+          # Sortie dans un fichier distinct puis renommage : mermaid-cli ne
+          # garantit pas de savoir lire et écrire le même fichier.
+          npx --yes "@mermaid-js/mermaid-cli@${MERMAID_CLI_VERSION}" \
+            --configFile mermaid-config.json \
+            --input support-de-cours.md \
+            --output support-avec-diagrammes.md
+          mv support-avec-diagrammes.md support-de-cours.md
+
+      # L'en-tête porte le logo. Chrome rend les templates d'en-tête et de pied
+      # dans un contexte isolé, sans accès réseau : une URL distante y resterait
+      # vide. Le SVG est donc récupéré ici et inliné en data URI. La marge haute
+      # passe de 18 à 24 mm pour lui laisser la place.
+      - name: Générer le support de cours en PDF
+        working-directory: build
+        run: |
+          LOGO_B64="$(curl -fsSL "$LOGO_URL" | base64 -w0)"
+          if [ -z "$LOGO_B64" ]; then
+            echo "::error::Logo vide ou introuvable : $LOGO_URL"
+            exit 1
+          fi
+
+          # Le titre part dans des templates HTML : &, < et > doivent être
+          # échappés, ici comme dans la page de garde plus bas.
+          esc_html() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+          TITLE_HTML="$(esc_html "$DOC_TITLE")"
+
+          # Page de garde. Elle remplace la mention « Source » qui fermait le
+          # document : le PDF circule détaché du dépôt, et c'est en l'ouvrant —
+          # pas à la dernière page — que le lecteur doit pouvoir dire d'où il
+          # vient et quelle version il tient.
+          #
+          # Le logo est le même data URI que celui de l'en-tête : le rendu se
+          # fait sans réseau, une URL distante resterait vide.
+          REPO_NAME_HTML="$(esc_html "${GITHUB_REPOSITORY}")"
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          REPO_URL_HTML="$(esc_html "$REPO_URL")"
+          VERSION_HTML="$(esc_html "${GITHUB_REF_NAME}")"
+
+          # Le bloc est ajouté en tête du document assemblé, après la réécriture
+          # des liens et le rendu mermaid : il ne contient ni lien vers un `.md`
+          # ni diagramme, ces étapes n'ont rien à en faire.
+          # Les lignes du bloc sont assemblées à part : la signature n'existe
+          # que si le dépôt a un `AUTHORS`, et une ligne vide au milieu du
+          # `<div>` couperait le bloc HTML en deux aux yeux du parseur Markdown.
+          # « Par » plutôt qu'« Auteur » : le libellé vaut quel que soit le
+          # nombre de personnes et ne présume de personne.
+          GARDE_ROWS="$(
+            if [ -s authors-line.txt ]; then
+              printf '    <dt>Par</dt><dd>%s</dd>\n' "$(esc_html "$(cat authors-line.txt)")"
+            fi
+            printf '    <dt>Dépôt</dt><dd>%s</dd>\n' "$REPO_NAME_HTML"
+            printf '    <dt>Source</dt><dd><a href="%s">%s</a></dd>\n' "$REPO_URL_HTML" "$REPO_URL_HTML"
+            printf '    <dt>Version</dt><dd>%s</dd>\n' "$VERSION_HTML"
+          )"
+
+          {
+            cat <<GARDE
+          <div class="page-de-garde">
+            <img src="data:image/svg+xml;base64,${LOGO_B64}" alt="">
+            <h1>${TITLE_HTML}</h1>
+            <dl>
+          ${GARDE_ROWS}
+            </dl>
+          </div>
+          GARDE
+            printf '\n'
+            cat support-de-cours.md
+          } > support-avec-garde.md
+          mv support-avec-garde.md support-de-cours.md
+
+          cat > pdf-options.json <<PDFOPTS
+          {
+            "format": "A4",
+            "margin": {"top": "24mm", "bottom": "20mm", "left": "16mm", "right": "16mm"},
+            "printBackground": true,
+            "displayHeaderFooter": true,
+            "headerTemplate": "<div style=\"width:100%;padding:8mm 16mm 0;text-align:right\"><img src=\"data:image/svg+xml;base64,${LOGO_B64}\" style=\"height:8mm\"></div>",
+            "footerTemplate": "<div style=\"width:100%;font-size:8px;color:#888;padding:0 16mm;display:flex;justify-content:space-between\"><span>${TITLE_HTML}</span><span class=\"pageNumber\"></span></div>"
+          }
+          PDFOPTS
+
+          # La page de garde comme l'intercalaire occupent une page entière.
+          # Leur hauteur (200 mm) reste sous la zone imprimable (297 - 24 - 20 =
+          # 253 mm) pour ne pas déborder sur une page blanche supplémentaire.
+          # L'intercalaire prend un saut de page avant ET après ; la garde
+          # ouvrant le document, seul le saut après a un sens.
+          #
+          # Ces règles passent par `--css`, qui AJOUTE une feuille par-dessus
+          # celles de md-to-pdf. `--stylesheet` remplacerait la liste par
+          # défaut, et le document perdrait toute sa mise en forme (markdown.css
+          # et la coloration syntaxique).
+          cat > support.css <<'CSS'
+          .page-de-garde {
+            page-break-after: always;
+            break-after: page;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 200mm;
+            text-align: center;
+          }
+          .page-de-garde img {
+            width: 55mm;
+            margin-bottom: 18mm;
+          }
+          /* Le titre du document ouvre la page : il doit primer sur le style de
+             h1 de markdown.css, filet inférieur compris. */
+          .page-de-garde h1 {
+            font-size: 34px;
+            font-weight: 700;
+            line-height: 1.3;
+            max-width: 80%;
+            margin: 0 0 16mm;
+            padding: 0;
+            border: 0;
+          }
+          /* Chaque entrée sur sa ligne : libellé discret, valeur en dessous. */
+          .page-de-garde dl {
+            margin: 0;
+            font-size: 12px;
+            line-height: 1.5;
+          }
+          .page-de-garde dt {
+            color: #888;
+            font-size: 9px;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            margin-top: 6mm;
+          }
+          .page-de-garde dd {
+            margin: 0;
+          }
+          .page-de-garde a {
+            color: inherit;
+            text-decoration: none;
+          }
+          .intercalaire {
+            page-break-before: always;
+            page-break-after: always;
+            break-before: page;
+            break-after: page;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 200mm;
+            text-align: center;
+          }
+          .intercalaire span {
+            font-size: 30px;
+            font-weight: 700;
+            line-height: 1.35;
+            max-width: 80%;
+          }
+          /* Le renvoi qui remplace un bloc <details>, et le retour depuis
+             l'annexe : discrets, pour ne pas se confondre avec le texte. */
+          .renvoi-annexe,
+          .retour-annexe {
+            font-style: italic;
+          }
+          .retour-annexe {
+            font-size: 0.9em;
+          }
+          /* Diagrammes mermaid, rendus en SVG à leur taille naturelle : jamais
+             plus larges que la colonne, ni plus hauts que la zone imprimable
+             (253 mm, marge de sécurité comprise). Une image ne se coupe pas :
+             si elle ne tient pas en bas de page, elle passe entière à la
+             suivante. Les proportions sont conservées. Le logo de la page de
+             garde, en data URI, ne correspond pas au sélecteur. */
+          img[src$=".svg"] {
+            display: block;
+            max-width: 100%;
+            max-height: 235mm;
+            width: auto;
+            height: auto;
+            margin: 0 auto;
+            break-inside: avoid;
+            page-break-inside: avoid;
+          }
+          /* Un tableau ne se coupe pas : s'il ne tient pas en bas de page, il
+             passe entier à la suivante. Seul un tableau plus haut qu'une page
+             se coupe encore, et alors entre deux lignes, jamais au milieu
+             d'une ligne. */
+          table,
+          tr {
+            break-inside: avoid;
+            page-break-inside: avoid;
+          }
+          /* Un titre reste avec ce qui le suit : sans cela, un tableau renvoyé
+             à la page suivante laisserait son titre seul en bas de page. */
+          h1, h2, h3, h4, h5, h6 {
+            break-after: avoid;
+            page-break-after: avoid;
+          }
+          CSS
+
+          npx --yes "md-to-pdf@${MD_TO_PDF_VERSION}" support-de-cours.md \
+            --document-title "$DOC_TITLE" \
+            --launch-options "{\"executablePath\":\"${CHROME_BIN}\"}" \
+            --css "$(cat support.css)" \
+            --pdf-options "$(cat pdf-options.json)"
+
+          # Le nom de travail reste neutre tout au long de l'assemblage — c'est
+          # à la sortie, et là seulement, que le document prend le nom du cours.
+          mv support-de-cours.pdf "../dist/${DOC_SLUG}-support-de-cours.pdf"
+
+      # ------------------------------------------------------------- garde-fou
+
+      # Marp comme md-to-pdf sortent parfois en code 0 sans avoir écrit de
+      # fichier exploitable. On vérifie donc que ce qui devait être produit l'a
+      # été : le support toujours, les slides seulement si `slides.md` existe.
+      - name: Vérifier les fichiers produits
+        run: |
+          expected=("dist/${DOC_SLUG}-support-de-cours.pdf")
+          if [ -f slides.md ]; then
+            expected+=(
+              "dist/${DOC_SLUG}-slides.pdf"
+              "dist/${DOC_SLUG}-slides.pptx"
+              "dist/${DOC_SLUG}-slides-white.pdf"
+              "dist/${DOC_SLUG}-slides-white.pptx"
+            )
+          else
+            echo "Pas de slides.md : aucune diapositive attendue."
+          fi
+
+          fail=0
+          for f in "${expected[@]}"; do
+            if [ ! -s "$f" ]; then
+              echo "::error::$f absent ou vide"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          ls -lh dist
+          {
+            echo "### Documents générés"
+            echo ""
+            echo "| Fichier | Taille |"
+            echo "|---|---|"
+            for f in dist/*; do
+              echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publier l'artefact
+        uses: actions/upload-artifact@v7
+        with:
+          name: documents
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: Publier la release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    # Seul ce job a besoin d'écrire : le job de build reste en lecture seule.
+    permissions:
+      contents: write
+
+    steps:
+      # Pas de checkout : gh n'a pas besoin du dépôt en local, GH_REPO suffit.
+      - name: Récupérer les documents générés
+        uses: actions/download-artifact@v8
+        with:
+          name: documents
+          path: dist
+
+      # `dist/*` plutôt qu'une liste figée : la release attache ce qui a
+      # réellement été produit, avec ou sans diapositives.
+      - name: Créer la release et y attacher les documents
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DOC_TITLE: ${{ needs.build.outputs.title }}
+        run: |
+          ls -lh dist
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${DOC_TITLE} ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag

@@ -1,0 +1,83 @@
+# TP Introduction à Elasticsearch — EISI
+# Environnement de LABORATOIRE : un nœud unique, TLS HTTP désactivé.
+# Ne pas utiliser tel quel en production (voir la doc Elastic "Docker in production").
+name: tp-elasticsearch
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    environment:
+      - node.name=es01
+      - cluster.name=tp-eisi
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - xpack.license.self_generated.type=basic
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "127.0.0.1:9200:9200"   # exposé uniquement en local
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    mem_limit: ${ES_MEM_LIMIT}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+
+  # Service éphémère : définit le mot de passe de l'utilisateur interne kibana_system
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    user: "0"
+    # Forme liste (exec) : chaque élément est un argv, aucun découpage sur les
+    # espaces. Ne pas passer la commande sur plusieurs lignes sans "\": dans un
+    # scalar YAML replié (">"), les lignes plus indentées gardent leur retour à
+    # la ligne et bash les exécute alors comme des commandes distinctes.
+    command:
+      - bash
+      - -c
+      - |
+        echo "Définition du mot de passe kibana_system"
+        until curl -s -X POST -u "elastic:${ELASTIC_PASSWORD}" \
+              -H "Content-Type: application/json" \
+              http://elasticsearch:9200/_security/user/kibana_system/_password \
+              -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q '^{}'
+        do
+          echo "Elasticsearch pas encore prêt, nouvelle tentative dans 5 s..."
+          sleep 5
+        done
+        echo "OK"
+    restart: "no"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+    ports:
+      - "127.0.0.1:5601:5601"
+    volumes:
+      - kibanadata:/usr/share/kibana/data
+    mem_limit: ${KB_MEM_LIMIT}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+
+volumes:
+  esdata:
+  kibanadata:

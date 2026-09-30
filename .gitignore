@@ -1,0 +1,129 @@
+# Fichiers parasites à ne jamais versionner : artefacts d'OS, d'éditeurs et
+# secrets locaux. Rien ici ne concerne le contenu du cours lui-même.
+
+# --- macOS ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.AppleDouble
+.LSOverride
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.apdisk
+
+# --- Windows ---
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.stackdump
+*.lnk
+
+# --- Linux ---
+*~
+.directory
+.Trash-*
+.nfs*
+
+# --- Éditeurs et IDE ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.history/
+*.code-workspace
+.idea/
+*.iml
+*.iws
+*.ipr
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+.\#*
+\#*\#
+.*.swp
+.*.swo
+*.bak
+*.tmp
+
+# --- Secrets et configuration locale ---
+.env
+.env.*
+!.env.example
+!.env.dist
+*.local
+secrets.*
+*.pem
+*.key
+
+# --- Dépendances et sorties d'outillage ---
+node_modules/
+vendor/
+.cache/
+dist/
+build/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Artefacts bureautiques et PDF temporaires ---
+~$*
+*.tmp.pdf
+
+# --- Assistants IA : directives aux agents et réglages locaux ---
+# Ces fichiers pilotent les agents de code (contexte, conventions, prompts) et
+# n'ont pas leur place dans un dépôt de cours public. Pour en partager un,
+# ajouter une exception `!NOM` sous la ligne concernée.
+
+# Directives, toutes graphies (Git est sensible à la casse hors Windows).
+CLAUDE.md
+CLAUDE.local.md
+claude.md
+AGENTS.md
+AGENT.md
+agents.md
+agent.md
+GEMINI.md
+gemini.md
+COPILOT.md
+QWEN.md
+WARP.md
+.cursorrules
+.windsurfrules
+.clinerules
+.roorules
+.aiderrules
+.aider.conf.yml
+.github/copilot-instructions.md
+.github/instructions/
+.github/prompts/
+.github/chatmodes/
+
+# Répertoires de configuration des agents.
+.claude/
+.cursor/
+.windsurf/
+.gemini/
+.codex/
+.junie/
+.opencode/
+.continue/
+.roo/
+.cline/
+.qodo/
+
+# Historiques et caches de session.
+.aider*
+.specstory/
+.ai/
