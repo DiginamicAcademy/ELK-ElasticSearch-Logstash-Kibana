@@ -42,7 +42,7 @@ jobs:
     # de lui ont une partie pédagogique.
     if: ${{ !github.event.repository.is_template }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     # Deux versions publiées coup sur coup : la seconde attend la première au
     # lieu de tenter de créer le même dépôt en même temps qu'elle.
@@ -164,12 +164,14 @@ jobs:
             fi
 
             # Le contenu du template est recopié de façon asynchrone : on
-            # attend que la branche par défaut existe avant d'y écrire.
+            # attend que la branche par défaut existe avant d'y écrire. Jusqu'à
+            # dix minutes : quand GitHub est chargé, la copie dépasse
+            # facilement les deux minutes.
             branche=$(cat "$RUNNER_TEMP/branche")
-            for essai in $(seq 1 30); do
+            for essai in $(seq 1 120); do
               gh api "repos/$PEDA/branches/$branche" --silent 2> /dev/null && break
-              if [ "$essai" -eq 30 ]; then
-                echo "::error::La branche $branche de $PEDA n'est toujours pas créée : la copie du template n'a pas abouti."
+              if [ "$essai" -eq 120 ]; then
+                echo "::error::La branche $branche de $PEDA n'est toujours pas créée au bout de dix minutes : la copie du template n'a pas abouti."
                 exit 1
               fi
               sleep 5
