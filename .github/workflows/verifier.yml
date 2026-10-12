@@ -1,0 +1,42 @@
+name: Vérifier
+
+# À chaque push qui touche config.yaml, s'assure que la déclaration du cours
+# est exploitable : structure, valeurs, existence des fiches et blocs RNCP sur
+# France Compétences, et des comptes GitHub des signataires. Les erreurs
+# s'affichent en annotations sur les lignes de config.yaml.
+#
+# Le même contrôle est refait à chaque version, avant la copie vers la partie
+# pédagogique (workflow « Pédagogie ») : ce run-ci ne fait que l'avancer au
+# moment où le fichier est modifié.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - config.yaml
+      - .github/scripts/verifier.py
+      - .github/workflows/verifier.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verifier:
+    # Le template porte des valeurs d'exemple (titre RNCP0000) : seuls les
+    # cours créés à partir de lui sont vérifiés.
+    if: ${{ !github.event.repository.is_template }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Installer PyYAML
+        run: pip install --quiet pyyaml
+
+      # Le jeton sert à vérifier les comptes GitHub des signataires.
+      - name: Vérifier config.yaml
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verifier.py

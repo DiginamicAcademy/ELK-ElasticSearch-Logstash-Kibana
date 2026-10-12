@@ -1,0 +1,58 @@
+name: Navigation
+
+# À chaque push qui touche un `.md` de la racine, pose ou remet en forme les
+# liens de navigation des chapitres — précédent, sommaire, suivant —, en tête
+# et en pied de chaque chapitre, puis commite le résultat sur la branche
+# poussée. Le détail est dans .github/scripts/navigation.py.
+#
+# Un commit poussé avec le GITHUB_TOKEN ne déclenche aucun workflow : celui-ci
+# ne se relance pas sur son propre commit.
+#
+# La branche distante prend ainsi un commit d'avance sur le poste de l'auteur,
+# qui le récupère avant de continuer : `git pull --rebase`.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "*.md"
+      - .github/scripts/navigation.py
+      - .github/workflows/navigation.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Deux pushes rapprochés : seul le plus récent compte, il voit tous les
+# chapitres.
+concurrency:
+  group: navigation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  navigation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Poser les liens de navigation
+        run: python3 .github/scripts/navigation.py
+
+      # Seuls les fichiers déjà suivis sont ajoutés : le script ne crée rien.
+      - name: Commiter les liens
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Rien à commiter."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --update
+          git commit -m "Navigation : liens entre chapitres"
+          # Refusé si la branche a avancé entre-temps : le push qui l'a fait
+          # avancer a déclenché son propre run, qui s'en charge.
+          if ! git push origin "HEAD:${GITHUB_REF_NAME}"; then
+            echo "::warning::Push refusé : la branche ${GITHUB_REF_NAME} a avancé entre-temps, ou elle est protégée. Le run du push suivant posera les liens ; sur une branche protégée, lancer le script en local."
+          fi

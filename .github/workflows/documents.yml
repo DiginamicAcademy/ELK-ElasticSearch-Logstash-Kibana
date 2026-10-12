@@ -22,9 +22,9 @@ name: Documents
 #   MongoDB-Python-slides.pdf
 #   MongoDB-Python-slides-white.pptx
 #
-# Le support est crédité : un fichier `AUTHORS` à la racine, s'il existe, porte
-# la ou les signatures — elles apparaissent sur la page de garde et ouvrent la
-# section « Crédits » qui ferme le document. Les contributeurs y sont listés
+# Le support est crédité : la section `credits` de config.yaml porte la ou les
+# signatures (`authors`) — elles apparaissent sur la page de garde et ouvrent
+# la section « Crédits » qui ferme le document. Les contributeurs y sont listés
 # ensuite, tirés de l'historique git et enrichis des comptes GitHub.
 #
 # Le workflow se déclenche uniquement sur un tag `v*` : les documents sont
@@ -37,6 +37,11 @@ name: Documents
 # `workflow_dispatch` reste ouvert pour un essai à blanc : il produit
 # l'artefact sans créer de release, ce qui permet de valider le rendu sans
 # consommer un numéro de version.
+#
+# Une fois la release publiée, le job « Partie pédagogique » crée ou met à
+# jour le dépôt privé `<cours>-Peda` à partir de config.yaml, et y lance la
+# génération de RNCP.yaml et du syllabus : voir pedagogie.yml. L'essai à
+# blanc, sans release, ne le déclenche pas.
 #
 # Les actions sont épinglées sur une majeure. Pour un usage réellement en
 # production, épinglez-les sur un SHA de commit plutôt que sur un tag mouvant.
@@ -183,31 +188,74 @@ jobs:
 
       # Qui signe le cours, et qui y a mis la main.
       #
-      # `AUTHORS`, s'il existe, porte la ou les signatures : c'est une décision
-      # éditoriale, pas une statistique, donc elle se déclare plutôt qu'elle ne
-      # se calcule. Une ligne par personne, les lignes vides et les `#` ignorés.
-      # Sans ce fichier, le document ne cite que les contributeurs.
+      # La section `credits` de config.yaml porte la ou les signatures
+      # (`authors`) : c'est une décision éditoriale, pas une statistique, donc
+      # elle se déclare plutôt qu'elle ne se calcule. Sans elle, le document ne
+      # cite que les contributeurs.
       #
       # Les contributeurs, eux, sortent de l'historique git — et non de
       # l'endpoint `contributors` de GitHub, qui perdrait les commits dont
-      # l'adresse n'est rattachée à aucun compte. GitHub ne sert qu'à enrichir :
-      # il seul sait relier une adresse de commit à un compte, d'où l'on tire un
-      # nom affichable et une adresse publique.
+      # l'adresse n'est rattachée à aucun compte. GitHub sert à les
+      # identifier : il seul sait relier une adresse de commit à un compte.
+      # Un commit rattaché à l'un des comptes déclarés pour un signataire
+      # (`github`) est le sien ; pour les autres, le compte fournit un nom
+      # affichable et une adresse publique. Aucune adresse n'a ainsi à figurer
+      # dans config.yaml, qui est public.
       #
-      # Tout est « best effort » : sans réseau, sans droits ou sans compte
-      # correspondant, on retombe sur l'identité du commit. Un document doit
-      # pouvoir se construire même quand l'API ne répond pas.
+      # Tout est « best effort » : sans réseau, sans droits, sans compte
+      # correspondant ou avec une section `credits` mal formée, on retombe sur
+      # l'identité du commit. Un document doit pouvoir se construire même quand
+      # l'API ne répond pas.
       - name: Recenser les crédits
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          : > build/authors.txt
           : > build/authors-line.txt
           : > build/contributors.txt
 
+          # Les cours créés avant config.yaml signaient dans AUTHORS : le
+          # fichier n'étant plus lu, son oubli priverait le support de
+          # signature sans que rien ne le dise.
           if [ -f AUTHORS ]; then
-            grep -vE '^[[:space:]]*(#|$)' AUTHORS > build/authors.txt || true
+            echo "::warning::Le fichier AUTHORS n'est plus lu : reportez ses signatures dans config.yaml, sous credits.authors."
           fi
+
+          # Deux fichiers tirés de config.yaml : les signatures, et les comptes
+          # GitHub des signataires.
+          python3 -c "import yaml" 2> /dev/null || pip install --quiet pyyaml
+          python3 - <<'PY'
+          import yaml
+
+          try:
+              with open("config.yaml", encoding="utf-8") as f:
+                  config = yaml.safe_load(f) or {}
+          except FileNotFoundError:
+              config = {}
+          except yaml.YAMLError as exc:
+              print(f"::warning::config.yaml ne se parse pas, crédits ignorés : {exc}")
+              config = {}
+
+          credits = config.get("credits") if isinstance(config, dict) else None
+          credits = credits if isinstance(credits, dict) else {}
+
+          auteurs, comptes = [], []
+          liste = credits.get("authors")
+          for auteur in liste if isinstance(liste, list) else []:
+              nom = auteur.get("name") if isinstance(auteur, dict) else None
+              if not (isinstance(nom, str) and nom.strip()):
+                  print(f"::warning::Signataire ignoré dans config.yaml, name est requis : {auteur!r}")
+                  continue
+              auteurs.append(nom.strip())
+              logins = auteur.get("github")
+              for login in logins if isinstance(logins, list) else []:
+                  if isinstance(login, str) and login.strip():
+                      comptes.append(login.strip().lstrip("@"))
+
+          for chemin, lignes in (("build/authors.txt", auteurs),
+                                 ("build/author-logins.txt", comptes)):
+              with open(chemin, "w", encoding="utf-8") as f:
+                  f.writelines(f"{ligne}\n" for ligne in lignes)
+          PY
 
           # « A », « A et B », « A, B et C » — la même chaîne servira à la page
           # de garde et à la section de crédits, écrite une fois pour les deux.
@@ -221,12 +269,11 @@ jobs:
                        printf "\n" }' build/authors.txt > build/authors-line.txt
             echo "Signature(s) : $(cat build/authors-line.txt)"
           else
-            echo "Signature(s) : aucune (pas de fichier AUTHORS)"
+            echo "Signature(s) : aucune (credits.authors absent de config.yaml)"
           fi
 
           # Identités des commits, les plus prolifiques d'abord. `%aN` et `%aE`
-          # passent par .mailmap : un fichier à la racine suffit à fusionner les
-          # adresses multiples d'une même personne.
+          # passent par un éventuel .mailmap, que git applique de lui-même.
           git log --format='%aN%x09%aE' \
             | sort | uniq -c | sort -rn | sed 's/^ *[0-9][0-9]* //' \
             > build/git-identities.tsv
@@ -251,7 +298,21 @@ jobs:
             case "$email" in *noreply@anthropic.com) continue ;; esac
             case "$name" in Claude*|*'[bot]') continue ;; esac
 
+            # Un signataire est déjà crédité plus haut : reconnu à son nom, ou
+            # au compte GitHub auquel le commit est rattaché. Il est écarté
+            # avant l'enrichissement : le nom de son compte (« Jeff Vial »)
+            # remplacerait celui d'`authors` (« Jean-François Vial »), et il
+            # reparaîtrait parmi les contributeurs.
+            if [ -s build/authors.txt ] && grep -qxF "$name" build/authors.txt; then
+              continue
+            fi
+            # `-i` : GitHub ignore la casse des identifiants de compte.
             login="$(awk -F'\t' -v e="$email" '$1 == e { print $2; exit }' build/logins.tsv)"
+            if [ -n "$login" ] && [ -s build/author-logins.txt ] \
+               && grep -qixF "$login" build/author-logins.txt; then
+              continue
+            fi
+
             if [ -n "$login" ]; then
               account="$(gh api "users/$login" --jq '[.name // "", .email // ""] | @tsv' 2>/dev/null)" || account=""
               gh_name="$(printf '%s' "$account" | cut -f1)"
@@ -263,7 +324,8 @@ jobs:
               if [ -n "$gh_email" ]; then email="$gh_email"; fi
             fi
 
-            # Déjà crédité comme signataire : on ne le répète pas plus bas.
+            # Un signataire dont le compte n'est pas déclaré peut encore être
+            # reconnu ici, au nom que porte ce compte.
             if [ -s build/authors.txt ] && grep -qxF "$name" build/authors.txt; then
               continue
             fi
@@ -704,6 +766,32 @@ jobs:
 
           node build/details-to-annex.js build/support-de-cours.md
 
+      # Une balise <picture> peut proposer, par une `<source>` à
+      # `media="(prefers-color-scheme: dark)"`, une version de l'image pour le
+      # thème sombre : c'est ainsi que le Readme affiche sur GitHub le logo
+      # adapté au thème du lecteur. Le PDF, lui, s'imprime sur fond blanc, mais
+      # Chrome choisit la source d'après le thème du système où il tourne : sur
+      # un poste réglé en sombre, il retiendrait le logo au texte clair,
+      # illisible sur le papier. Ces sources sont donc retirées, et l'`<img>`
+      # de repli, la version pour fond clair, s'affiche toujours.
+      #
+      # Une ligne qui ne portait que la balise disparaît avec elle : restée
+      # vide, elle couperait le bloc HTML en deux, et la suite, indentée,
+      # deviendrait un bloc de code. Les blocs de code ne sont pas touchés.
+      - name: Retenir la version claire des images
+        run: |
+          awk '
+            /^[[:space:]]*(```|~~~)/ { fenced = !fenced; print; next }
+            fenced { print; next }
+            /<source[^>]*prefers-color-scheme:[[:space:]]*dark/ {
+              n += gsub(/<source[^>]*prefers-color-scheme:[[:space:]]*dark[^>]*>/, "")
+              if ($0 ~ /^[[:space:]]*$/) next
+            }
+            { print }
+            END { print "Sources pour thème sombre retirées : " n + 0 > "/dev/stderr" }
+          ' build/support-de-cours.md > build/support-clair.md
+          mv build/support-clair.md build/support-de-cours.md
+
       # Les chemins des images locales (`./res/logo.png`) sont écrits depuis la
       # racine du dépôt, où vivent le Readme et les chapitres. Le support, lui,
       # est assemblé et converti dans `build/`, et md-to-pdf y résout ces
@@ -899,7 +987,7 @@ jobs:
           # des liens et le rendu mermaid : il ne contient ni lien vers un `.md`
           # ni diagramme, ces étapes n'ont rien à en faire.
           # Les lignes du bloc sont assemblées à part : la signature n'existe
-          # que si le dépôt a un `AUTHORS`, et une ligne vide au milieu du
+          # que si config.yaml déclare des signataires, et une ligne vide au milieu du
           # `<div>` couperait le bloc HTML en deux aux yeux du parseur Markdown.
           # « Par » plutôt qu'« Auteur » : le libellé vaut quel que soit le
           # nombre de personnes et ne présume de personne.
@@ -1141,3 +1229,13 @@ jobs:
             --title "${DOC_TITLE} ${GITHUB_REF_NAME}" \
             --generate-notes \
             --verify-tag
+
+  # La partie pédagogique suit les versions publiées, et elles seules : elle
+  # attend que la release existe. Seul PEDA_TOKEN lui est transmis, pas
+  # l'ensemble des secrets.
+  pedagogie:
+    name: Partie pédagogique
+    needs: release
+    uses: ./.github/workflows/pedagogie.yml
+    secrets:
+      PEDA_TOKEN: ${{ secrets.PEDA_TOKEN }}

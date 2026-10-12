@@ -1,0 +1,13 @@
+course:
+  name: "La stack ELK"
+  RNCP:
+    - RNCP40573
+  RNCPBloc: []
+  timing: 3
+
+credits:
+  authors:
+    - name: Jean-François Vial
+      github:
+        - JeffDiginamic
+        - j33f

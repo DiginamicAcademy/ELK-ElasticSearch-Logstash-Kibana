@@ -1,0 +1,253 @@
+name: Pédagogie
+
+# Crée ou met à jour la partie pédagogique du cours, puis y lance la génération
+# de RNCP.yaml et du syllabus.
+#
+# La partie pédagogique vit dans un dépôt privé distinct, nommé d'après ce
+# dépôt-ci — `Angular-22` → `Angular-22-Peda` — et créé à partir du template
+# DiginamicAcademy/Template-Cours-Private. Elle porte ce qui ne se diffuse pas
+# aux apprenant·e·s. À chaque version publiée :
+#
+#   1. config.yaml est vérifié ;
+#   2. le dépôt `-Peda` est créé, s'il n'existe pas encore ;
+#   3. la section course de config.yaml y est recopiée, complétée de
+#      course.repository — l'URL de ce dépôt-ci, que la partie pédagogique
+#      clone pour lire le cours ;
+#   4. son workflow « Régénérer les documents » est lancé sur le tag publié :
+#      Claude y écrit RNCP.yaml et syllabus.md, et une pull request y est
+#      ouverte pour relecture.
+#
+# Appelé par le workflow Documents, une fois la release publiée. Se lance aussi
+# à la main depuis un tag (Run workflow → « Use workflow from » → Tags) : c'est
+# ainsi qu'on rejoue une version dont la partie pédagogique a échoué.
+#
+# Le GITHUB_TOKEN n'ouvre que ce dépôt-ci : la création du dépôt privé et tout
+# ce qui s'y fait passent par le secret d'organisation PEDA_TOKEN. Voir le
+# chapitre 05-Partie-pedagogique.md.
+
+on:
+  workflow_call:
+    secrets:
+      PEDA_TOKEN:
+        required: false
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pedagogie:
+    name: Créer ou mettre à jour la partie pédagogique
+    # Le template porte des valeurs d'exemple : seuls les cours créés à partir
+    # de lui ont une partie pédagogique.
+    if: ${{ !github.event.repository.is_template }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Deux versions publiées coup sur coup : la seconde attend la première au
+    # lieu de tenter de créer le même dépôt en même temps qu'elle.
+    concurrency:
+      group: pedagogie
+      cancel-in-progress: false
+
+    env:
+      TEMPLATE_PEDA: DiginamicAcademy/Template-Cours-Private
+
+    steps:
+      - name: Vérifier le déclencheur et le jeton
+        env:
+          GH_TOKEN: ${{ secrets.PEDA_TOKEN }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::La partie pédagogique se génère pour une version publiée : lancez le workflow depuis un tag (Run workflow → « Use workflow from » → Tags), et non depuis la branche $GITHUB_REF_NAME."
+            exit 1
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Le secret PEDA_TOKEN n'est pas configuré : impossible de créer ou de modifier le dépôt de la partie pédagogique."
+            echo "Posez-le au niveau de l'organisation pour que tous les cours en héritent (voir le chapitre 05-Partie-pedagogique.md)."
+            exit 1
+          fi
+
+          PEDA="${GITHUB_REPOSITORY_OWNER}/${GITHUB_REPOSITORY#*/}-Peda"
+          echo "PEDA=$PEDA" >> "$GITHUB_ENV"
+          echo "Cours              : $GITHUB_REPOSITORY, version $GITHUB_REF_NAME"
+          echo "Partie pédagogique : $PEDA"
+
+      # Le checkout se fait sur le tag : c'est le config.yaml de la version
+      # publiée qui part dans la partie pédagogique.
+      - uses: actions/checkout@v7
+
+      - name: Installer PyYAML
+        run: pip install --quiet pyyaml
+
+      # Une déclaration invalide ne quitte pas ce dépôt : la régénération,
+      # qui paie des appels à Claude, n'est pas lancée sur des valeurs fausses.
+      - name: Vérifier config.yaml
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verifier.py
+
+      # Seule la section course part dans la partie pédagogique : c'est la
+      # seule qu'elle lit, la section credits ne sert qu'au support de cours.
+      # La copie est complétée de course.repository, que la partie pédagogique
+      # lit pour cloner le cours. L'en-tête de l'original, qui décrit le
+      # fichier vu du cours, est remplacé par un avertissement : la copie est
+      # écrasée à chaque version, la modifier là-bas ne sert à rien.
+      - name: Préparer la copie de config.yaml
+        run: |
+          python3 - "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$RUNNER_TEMP/config.yaml" <<'PY'
+          import re
+          import sys
+
+          import yaml
+
+          depot, sortie = sys.argv[1:]
+
+          # Les lignes de la section course : de sa clé jusqu'à la clé de
+          # premier niveau suivante. Les lignes vides et les commentaires qui
+          # la terminent annoncent la section suivante : ils partent avec elle.
+          lignes, dans_course = [], False
+          for l in open("config.yaml", encoding="utf-8").read().splitlines():
+              if l and not l[0].isspace() and not l.startswith("#"):
+                  dans_course = re.match(r"course\s*:", l) is not None
+              if dans_course:
+                  lignes.append(l)
+          while lignes and (not lignes[-1].strip() or lignes[-1].startswith("#")):
+              lignes.pop()
+          # Une valeur posée dans le cours (le vérificateur la signale) est
+          # remplacée : le dépôt du cours est celui où tourne ce workflow.
+          lignes = [l for l in lignes if not re.match(r"\s+repository\s*:", l)]
+
+          copie = [
+              f"# Copie de config.yaml du cours {depot},",
+              "# écrite à chaque version par son workflow « Pédagogie ». Ne pas la modifier",
+              "# ici : modifier config.yaml dans le cours, la copie est remplacée à la",
+              "# version suivante.",
+          ]
+          for i, l in enumerate(lignes):
+              copie.append(l)
+              if re.match(r"course\s*:\s*(#.*)?$", l):
+                  # Même retrait que les autres champs de course.
+                  suivante = next((s for s in lignes[i + 1:] if s.strip() and not s.lstrip().startswith("#")), "")
+                  retrait = re.match(r"\s*", suivante).group() or "  "
+                  copie.append(f'{retrait}repository: "{depot}" ## dépôt du cours, cloné dans CoursPublic/')
+          texte = "\n".join(copie) + "\n"
+
+          # Garde-fou : la copie se relit, et désigne bien ce dépôt-ci.
+          if (yaml.safe_load(texte).get("course") or {}).get("repository") != depot:
+              print("::error::La copie de config.yaml ne porte pas course.repository : la section « course » doit être écrite en bloc, une clé par ligne.")
+              sys.exit(1)
+          open(sortie, "w", encoding="utf-8", newline="\n").write(texte)
+          PY
+          cat "$RUNNER_TEMP/config.yaml"
+
+      # Un 404 signifie que le dépôt n'existe pas — ou que PEDA_TOKEN ne le
+      # voit pas. Dans ce second cas, c'est la création qui échoue : le nom
+      # est déjà pris.
+      - name: Créer le dépôt de la partie pédagogique s'il n'existe pas
+        env:
+          GH_TOKEN: ${{ secrets.PEDA_TOKEN }}
+        run: |
+          if gh api "repos/$PEDA" --jq .default_branch > "$RUNNER_TEMP/branche" 2> "$RUNNER_TEMP/erreur"; then
+            echo "Le dépôt $PEDA existe déjà."
+          elif grep -q "HTTP 404" "$RUNNER_TEMP/erreur"; then
+            echo "Création de $PEDA à partir de $TEMPLATE_PEDA."
+            if ! gh api -X POST "repos/$TEMPLATE_PEDA/generate" \
+                   -f owner="$GITHUB_REPOSITORY_OWNER" \
+                   -f name="${PEDA#*/}" \
+                   -f description="Partie pédagogique du cours $GITHUB_REPOSITORY" \
+                   -F private=true \
+                   --jq .default_branch > "$RUNNER_TEMP/branche" 2> "$RUNNER_TEMP/erreur"; then
+              echo "::error::Création de $PEDA refusée : $(cat "$RUNNER_TEMP/erreur")"
+              echo "Causes possibles : PEDA_TOKEN n'a pas la permission Administration en écriture sur l'organisation ; $TEMPLATE_PEDA n'est pas marqué « Template repository » ; le dépôt existe déjà, mais hors de portée du jeton."
+              exit 1
+            fi
+
+            # Le contenu du template est recopié de façon asynchrone : on
+            # attend que la branche par défaut existe avant d'y écrire.
+            branche=$(cat "$RUNNER_TEMP/branche")
+            for essai in $(seq 1 30); do
+              gh api "repos/$PEDA/branches/$branche" --silent 2> /dev/null && break
+              if [ "$essai" -eq 30 ]; then
+                echo "::error::La branche $branche de $PEDA n'est toujours pas créée : la copie du template n'a pas abouti."
+                exit 1
+              fi
+              sleep 5
+            done
+
+            # La régénération ouvre une pull request : le dépôt doit l'autoriser
+            # (Settings → Actions → General → Workflow permissions).
+            gh api -X PUT "repos/$PEDA/actions/permissions/workflow" \
+              -f default_workflow_permissions=read \
+              -F can_approve_pull_request_reviews=true --silent \
+              || echo "::warning::Impossible d'autoriser les Actions de $PEDA à ouvrir des pull requests (réglage bloqué par l'organisation ?) : à faire à la main, Settings → Actions → General."
+          else
+            echo "::error::Impossible de consulter $PEDA : $(cat "$RUNNER_TEMP/erreur")"
+            exit 1
+          fi
+
+          echo "BRANCHE=$(cat "$RUNNER_TEMP/branche")" >> "$GITHUB_ENV"
+
+      # Par l'API plutôt que par un clone : le jeton ne transite par aucun
+      # fichier. Rien n'est commité si la copie n'a pas changé.
+      - name: Recopier config.yaml dans la partie pédagogique
+        env:
+          GH_TOKEN: ${{ secrets.PEDA_TOKEN }}
+        run: |
+          CHEMIN="repos/$PEDA/contents/config.yaml"
+          if gh api "$CHEMIN?ref=$BRANCHE" > "$RUNNER_TEMP/actuel.json" 2> "$RUNNER_TEMP/erreur"; then
+            # L'API rend le contenu en base64 coupé en lignes, ce que base64 -d accepte.
+            if jq -r .content "$RUNNER_TEMP/actuel.json" | base64 -d | cmp -s - "$RUNNER_TEMP/config.yaml"; then
+              echo "config.yaml est déjà à jour dans $PEDA."
+              exit 0
+            fi
+            sha=$(jq -r .sha "$RUNNER_TEMP/actuel.json")
+          elif grep -q "HTTP 404" "$RUNNER_TEMP/erreur"; then
+            sha=""
+          else
+            echo "::error::Lecture de config.yaml dans $PEDA impossible : $(cat "$RUNNER_TEMP/erreur")"
+            exit 1
+          fi
+
+          args=(
+            -X PUT "$CHEMIN"
+            -f message="config.yaml : copie du cours $GITHUB_REPOSITORY ($GITHUB_REF_NAME)"
+            -f content="$(base64 -w0 "$RUNNER_TEMP/config.yaml")"
+            -f branch="$BRANCHE"
+            -f "committer[name]=github-actions[bot]"
+            -f "committer[email]=41898282+github-actions[bot]@users.noreply.github.com"
+          )
+          [ -z "$sha" ] || args+=(-f sha="$sha")
+          gh api "${args[@]}" --silent
+          echo "config.yaml recopié dans $PEDA."
+
+      # Un dépôt tout juste créé met quelques instants à recenser ses
+      # workflows : l'appel est retenté avant de conclure à un échec.
+      - name: Lancer la régénération des documents
+        env:
+          GH_TOKEN: ${{ secrets.PEDA_TOKEN }}
+        run: |
+          for essai in $(seq 1 12); do
+            if gh api -X POST "repos/$PEDA/actions/workflows/regenerer-documents.yml/dispatches" \
+                 -f ref="$BRANCHE" \
+                 -f "inputs[version]=$GITHUB_REF_NAME" \
+                 --silent 2> "$RUNNER_TEMP/erreur"; then
+              break
+            fi
+            if [ "$essai" -eq 12 ]; then
+              echo "::error::Impossible de lancer « Régénérer les documents » dans $PEDA : $(cat "$RUNNER_TEMP/erreur")"
+              echo "Vérifiez que les Actions y sont activées et que PEDA_TOKEN porte la permission Actions en écriture."
+              exit 1
+            fi
+            sleep 10
+          done
+
+          URL="$GITHUB_SERVER_URL/$PEDA/actions/workflows/regenerer-documents.yml"
+          echo "Régénération lancée sur la version $GITHUB_REF_NAME : $URL"
+          {
+            echo "### Partie pédagogique"
+            echo ""
+            echo "Dépôt : [$PEDA]($GITHUB_SERVER_URL/$PEDA)"
+            echo ""
+            echo "[Régénération lancée]($URL) sur la version \`$GITHUB_REF_NAME\` : une pull request y sera ouverte, à relire avant fusion."
+          } >> "$GITHUB_STEP_SUMMARY"
